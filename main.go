@@ -1,9 +1,16 @@
-package monzosweep
+package main
 
 import (
-	"errors"
+	"context"
+	"encoding/base64"
 	"fmt"
+	"os"
 
+	"monzoutils"
+
+	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/kms"
 	uuid "github.com/satori/go.uuid"
 	monzo "github.com/tjvr/go-monzo"
 )
@@ -16,17 +23,13 @@ type userConfig struct {
 	forceTriggerAccountID string
 }
 
-func formatToGbp(pennies int64) string {
-	return fmt.Sprintf("£%v", float64(pennies)/100)
-}
-
 func notifyUser(cl monzo.Client, deposits []*monzo.DepositRequest, dryRun bool) error {
 	numPots := len(deposits)
 	totalDesposited := int64(0)
 	for _, deposit := range deposits {
 		totalDesposited += deposit.Amount
 	}
-	fmt.Printf("Total deposits: %s\n", formatToGbp(totalDesposited))
+	fmt.Printf("Total deposits: %s\n", monzoutils.FormatPenceToGbp(totalDesposited))
 
 	title := "🛒 Payday Sweep"
 	if dryRun {
@@ -38,41 +41,14 @@ func notifyUser(cl monzo.Client, deposits []*monzo.DepositRequest, dryRun bool) 
 		Type:      "basic",
 		URL:       "http://www.github.com/ojcm",
 		Title:     title,
-		Body:      fmt.Sprintf("Transferred %s to %d pots", formatToGbp(totalDesposited), numPots),
-		ImageURL:  "https://raw.githubusercontent.com/golang-samples/gopher-vector/master/gopher.png",
+		Body: fmt.Sprintf("Transferred %s to %d pots",
+			monzoutils.FormatPenceToGbp(totalDesposited), numPots),
+		ImageURL: "https://raw.githubusercontent.com/golang-samples/gopher-vector/master/gopher.png",
 	})
 }
 
-// TODO implement this
 func shouldTriggerSweepFromTransaction(transaction *monzo.Transaction) bool {
-	return true
-}
-
-func getClient(accessToken string) monzo.Client {
-	return monzo.Client{
-		BaseURL:     "https://api.monzo.com",
-		AccessToken: accessToken,
-	}
-}
-
-func getAccountWithID(cl monzo.Client, accountID string) (*monzo.Account, error) {
-
-	accounts, err := cl.Accounts("uk_retail")
-	if err != nil {
-		return nil, err
-	}
-
-	var sourceAccount *monzo.Account
-	for _, account := range accounts {
-		if account.ID == accountID {
-			sourceAccount = account
-			break
-		}
-	}
-	if sourceAccount == nil {
-		return nil, errors.New("Account associated with trigger transaction not found")
-	}
-	return sourceAccount, nil
+	return transaction.Description == "MONTHLY SALARY"
 }
 
 func calcMoneyToSweep(cl monzo.Client, transaction *monzo.Transaction) (int64, error) {
@@ -95,7 +71,7 @@ func calcDeposits(sweepAmount int64, sourceAccountID string, pots []*monzo.Pot) 
 
 	var deposits []*monzo.DepositRequest
 	for _, pot := range pots {
-		fmt.Printf("Creating deposit of %s to pot %s\n", formatToGbp(perPotAmount), pot.Name)
+		fmt.Printf("Creating deposit of %s to pot %s\n", monzoutils.FormatPenceToGbp(perPotAmount), pot.Name)
 		deposits = append(deposits, &monzo.DepositRequest{
 			PotID:          pot.ID,
 			AccountID:      sourceAccountID,
@@ -105,33 +81,6 @@ func calcDeposits(sweepAmount int64, sourceAccountID string, pots []*monzo.Pot) 
 	}
 
 	return deposits
-}
-
-func getActivePots(cl monzo.Client) ([]*monzo.Pot, error) {
-	allPots, err := cl.Pots()
-	if err != nil {
-		return nil, err
-	}
-	var activePots []*monzo.Pot
-	for _, pot := range allPots {
-		if !pot.Deleted {
-			activePots = append(activePots, pot)
-		}
-	}
-	if len(activePots) == 0 {
-		return nil, errors.New("No active pots found")
-	}
-	return activePots, nil
-}
-
-func processDeposits(cl monzo.Client, deposits []*monzo.DepositRequest) error {
-	for _, deposit := range deposits {
-		_, err := cl.Deposit(deposit)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func processTransaction(config userConfig, transaction *monzo.Transaction) error {
@@ -149,7 +98,7 @@ func processTransaction(config userConfig, transaction *monzo.Transaction) error
 	}
 
 	// Get client for processing
-	cl := getClient(config.accessToken)
+	cl := monzoutils.GetClient(config.accessToken)
 
 	// Calculate how much money to move
 	var err error
@@ -164,7 +113,7 @@ func processTransaction(config userConfig, transaction *monzo.Transaction) error
 	}
 
 	// Get the pots to move it to
-	pots, err := getActivePots(cl)
+	pots, err := monzoutils.GetActivePots(cl)
 	if err != nil {
 		return err
 	}
@@ -174,7 +123,7 @@ func processTransaction(config userConfig, transaction *monzo.Transaction) error
 
 	//Send DepositRequests
 	if !config.dryRun {
-		err = processDeposits(cl, deposits)
+		err = monzoutils.ProcessDeposits(cl, deposits)
 		if err != nil {
 			return err
 		}
@@ -185,32 +134,51 @@ func processTransaction(config userConfig, transaction *monzo.Transaction) error
 	return nil
 }
 
+func getAccessToken() string {
+	encrypted := os.Getenv("accessToken")
+
+	kmsClient := kms.New(session.New())
+	decodedBytes, err := base64.StdEncoding.DecodeString(encrypted)
+	if err != nil {
+		panic(err)
+	}
+	input := &kms.DecryptInput{
+		CiphertextBlob: decodedBytes,
+	}
+	response, err := kmsClient.Decrypt(input)
+	if err != nil {
+		panic(err)
+	}
+	// Plaintext is a byte array, so convert to string
+	return string(response.Plaintext[:])
+}
+
 // DryRun is a method used during development for initiating a 'Dry Run'
 // of the monzo sweep function.
-func DryRun(accessToken string) error {
+func dryRun(accessToken string) error {
 	config := userConfig{
 		accessToken:           accessToken,
 		dryRun:                true,
 		forceTrigger:          true,
 		forceTriggerAmount:    600,
-		forceTriggerAccountID: "acc_00009k4AHcfvBYRqiAD6qP",
+		forceTriggerAccountID: monzoutils.GetFirstAccountIDFromAccessToken(accessToken),
 	}
 
 	return processTransaction(config, nil)
 }
 
+// MyEvent is a dummy event for AWS Lambda triggering
+type MyEvent struct {
+	name string
+}
+
+// HandleRequest handles the Lambda invocation.  Currently does a dry run.
+func HandleRequest(ctx context.Context, event MyEvent) (string, error) {
+	accessToken := getAccessToken()
+
+	return "", dryRun(accessToken)
+}
+
 func main() {
-
-	config := userConfig{
-		accessToken:           "not_my_access_token",
-		dryRun:                true,
-		forceTrigger:          true,
-		forceTriggerAmount:    6,
-		forceTriggerAccountID: "acc_not_my_acc",
-	}
-
-	err := processTransaction(config, nil)
-	if err != nil {
-		fmt.Println(err)
-	}
+	lambda.Start(HandleRequest)
 }
